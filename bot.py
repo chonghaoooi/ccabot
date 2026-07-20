@@ -86,12 +86,12 @@ async def fetch_form_text(url: str) -> tuple[str, str]:
 
 
 async def ai_extract_event(title: str, description: str) -> dict | None:
-    """Ask the local model to pull structured event fields out of messy form text."""
+    """Ask the local model to pull structured event fields out of messy form/announcement text."""
     now_local = datetime.now(TZ)
     prompt = (
         f"Today's date is {now_local.strftime('%Y-%m-%d')} (Asia/Singapore time). "
         "Extract event details from this text and respond with ONLY a JSON object, "
-        'no other text: {"date": "YYYY-MM-DD", "time": "HH:MM" (24h, start time only), '
+        'no other text: {"name": str, "date": "YYYY-MM-DD", "time": "HH:MM" (24h, start time only), '
         '"location": str or null}.\n\n'
         f"Title: {title}\n\nText:\n{description}"
     )
@@ -254,6 +254,38 @@ async def event_from_form(interaction: discord.Interaction, url: str,
         extracted.get("date", ""),
         extracted.get("time", ""),
         description[:1000],
+        extracted.get("location"),
+        remind_before.value if remind_before else 5,
+    )
+
+
+@client.tree.command(name="event_from_text", description="Create an event by pasting an announcement (works for any form/source)", guild=guild_obj)
+@app_commands.describe(text="Paste the event announcement / form description here",
+                        name="Event name (optional, auto-detected if left blank)",
+                        remind_before="Reminder timing (default 5 minutes)")
+@app_commands.choices(remind_before=REMIND_CHOICES)
+async def event_from_text(interaction: discord.Interaction, text: str, name: str = None,
+                           remind_before: app_commands.Choice[int] = None):
+    if not is_organiser(interaction):
+        await interaction.response.send_message("You do not have permission to manage events.", ephemeral=True)
+        return
+    await interaction.response.defer()
+
+    extracted = await ai_extract_event("", text)
+    if not extracted:
+        await interaction.followup.send(
+            "Couldn't extract event details from that text. Is Ollama running? "
+            "Use /event_add manually instead.", ephemeral=True)
+        return
+    event_name = name or extracted.get("name") or text.strip().split("\n")[0][:100]
+
+    log.info("text extraction: %s", extracted)
+    await create_event(
+        interaction,
+        event_name,
+        extracted.get("date", ""),
+        extracted.get("time", ""),
+        text[:1000],
         extracted.get("location"),
         remind_before.value if remind_before else 5,
     )
