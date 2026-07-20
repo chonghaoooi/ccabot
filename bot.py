@@ -99,6 +99,8 @@ async def fetch_msform_text(url: str) -> tuple[str, str]:
             page = await browser.new_page()
             await page.goto(url, wait_until="networkidle", timeout=20000)
             await page.wait_for_timeout(1000)
+            if "login.microsoftonline.com" in page.url:
+                raise RuntimeError("form requires sign-in - not publicly accessible")
             title_el = await page.query_selector("[class*='title'], h1")
             title = (await title_el.inner_text()).strip() if title_el else "Untitled Event"
             body_text = await page.inner_text("body")
@@ -266,6 +268,12 @@ async def event_from_form(interaction: discord.Interaction, url: str,
             title, description = await fetch_msform_text(url)
     except (aiohttp.ClientError, TimeoutError):
         await interaction.followup.send("Couldn't fetch that form. Check the link is public.", ephemeral=True)
+        return
+    except RuntimeError:
+        await interaction.followup.send(
+            "That form requires signing in, so I can't read it automatically. "
+            "Open it yourself, copy the description text, and use /event_from_text instead.",
+            ephemeral=True)
         return
 
     extracted = await ai_extract_event(title, description)
