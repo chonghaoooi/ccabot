@@ -98,12 +98,20 @@ async def fetch_msform_text(url: str) -> tuple[str, str]:
         try:
             page = await browser.new_page()
             await page.goto(url, wait_until="networkidle", timeout=20000)
-            await page.wait_for_timeout(1000)
+            # sign-in redirect and content render both happen async after networkidle -
+            # poll instead of a fixed sleep so we don't race either one.
+            body_text = ""
+            for _ in range(8):
+                await page.wait_for_timeout(750)
+                if "login.microsoftonline.com" in page.url:
+                    raise RuntimeError("form requires sign-in - not publicly accessible")
+                body_text = await page.inner_text("body")
+                if "Loading" not in body_text:
+                    break
             if "login.microsoftonline.com" in page.url:
                 raise RuntimeError("form requires sign-in - not publicly accessible")
             title_el = await page.query_selector("[class*='title'], h1")
             title = (await title_el.inner_text()).strip() if title_el else "Untitled Event"
-            body_text = await page.inner_text("body")
         finally:
             await browser.close()
     return title, body_text[:1500]
