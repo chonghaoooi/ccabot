@@ -33,6 +33,7 @@ REMIND_CHOICES = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cca-bot")
 
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 db = sqlite3.connect(DB_PATH)
 db.execute("""
 CREATE TABLE IF NOT EXISTS events (
