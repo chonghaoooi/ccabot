@@ -3,6 +3,7 @@ import os
 import sqlite3
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import discord
@@ -10,7 +11,8 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
@@ -18,7 +20,7 @@ EVENT_CHANNEL_ID = int(os.environ["EVENT_CHANNEL_ID"])
 CCA_ROLE_ID = int(os.environ["CCA_ROLE_ID"])
 ORGANISER_ROLE_ID = int(os.environ["ORGANISER_ROLE_ID"])
 TZ = ZoneInfo("Asia/Singapore")
-DB_PATH = os.environ.get("DB_PATH", "events.db")
+DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "events.db"))
 
 REMIND_CHOICES = [
     app_commands.Choice(name="5 minutes", value=5),
@@ -30,7 +32,8 @@ REMIND_CHOICES = [
     app_commands.Choice(name="1 day", value=1440),
 ]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                     filename=BASE_DIR / "bot.log")
 log = logging.getLogger("cca-bot")
 
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)

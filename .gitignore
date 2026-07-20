@@ -1,3 +1,4 @@
 .env
 events.db
+bot.log
 __pycache__/
