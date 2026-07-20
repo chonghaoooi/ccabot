@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
+from playwright.async_api import async_playwright
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -83,6 +84,27 @@ async def fetch_form_text(url: str) -> tuple[str, str]:
         data = json.loads(data_m.group(1))
         description = data[1][0] or ""
     return title, description
+
+
+async def fetch_msform_text(url: str) -> tuple[str, str]:
+    """Returns (title, description) from a Microsoft Forms page by rendering it headlessly.
+
+    Microsoft Forms is a JS-rendered SPA - the raw HTML has no content, so a plain HTTP
+    fetch (like fetch_form_text uses for Google Forms) returns nothing. Only path in is
+    an actual browser render.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=20000)
+            await page.wait_for_timeout(1000)
+            title_el = await page.query_selector("[class*='title'], h1")
+            title = (await title_el.inner_text()).strip() if title_el else "Untitled Event"
+            body_text = await page.inner_text("body")
+        finally:
+            await browser.close()
+    return title, body_text[:1500]
 
 
 async def ai_extract_event(title: str, description: str) -> dict | None:
@@ -221,21 +243,27 @@ async def event_add(interaction: discord.Interaction, name: str, date: str, time
                         remind_before.value if remind_before else 5)
 
 
-@client.tree.command(name="event_from_form", description="Create an event by extracting details from a Google Form link", guild=guild_obj)
-@app_commands.describe(url="Google Form link (viewform)", remind_before="Reminder timing (default 5 minutes)")
+@client.tree.command(name="event_from_form", description="Create an event by extracting details from a Google/Microsoft Form link", guild=guild_obj)
+@app_commands.describe(url="Google Form or Microsoft Form link", remind_before="Reminder timing (default 5 minutes)")
 @app_commands.choices(remind_before=REMIND_CHOICES)
 async def event_from_form(interaction: discord.Interaction, url: str,
                            remind_before: app_commands.Choice[int] = None):
     if not is_organiser(interaction):
         await interaction.response.send_message("You do not have permission to manage events.", ephemeral=True)
         return
-    if "docs.google.com/forms" not in url:
-        await interaction.response.send_message("That doesn't look like a Google Form link.", ephemeral=True)
+    is_google = "docs.google.com/forms" in url
+    is_microsoft = "forms.office.com" in url or "forms.microsoft.com" in url
+    if not (is_google or is_microsoft):
+        await interaction.response.send_message(
+            "That doesn't look like a Google or Microsoft Form link.", ephemeral=True)
         return
     await interaction.response.defer()
 
     try:
-        title, description = await fetch_form_text(url)
+        if is_google:
+            title, description = await fetch_form_text(url)
+        else:
+            title, description = await fetch_msform_text(url)
     except (aiohttp.ClientError, TimeoutError):
         await interaction.followup.send("Couldn't fetch that form. Check the link is public.", ephemeral=True)
         return
