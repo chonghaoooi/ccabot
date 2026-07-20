@@ -1,4 +1,5 @@
 """Discord CCA event reminder bot. One file, MVP scope."""
+import io
 import json
 import os
 import re
@@ -10,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
+import pytesseract
+from PIL import Image
 from playwright.async_api import async_playwright
 from discord import app_commands
 from discord.ext import tasks
@@ -26,6 +29,9 @@ ORGANISER_ROLE_ID = int(os.environ["ORGANISER_ROLE_ID"])
 TZ = ZoneInfo("Asia/Singapore")
 DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "events.db"))
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:1.5b")
+TESSERACT_CMD = os.environ.get("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+if os.path.exists(TESSERACT_CMD):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 REMIND_CHOICES = [
     app_commands.Choice(name="5 minutes", value=5),
@@ -115,6 +121,16 @@ async def fetch_msform_text(url: str) -> tuple[str, str]:
         finally:
             await browser.close()
     return title, body_text[:1500]
+
+
+def read_image_text(image_bytes: bytes) -> str:
+    """Transcribe visible text in a screenshot with Tesseract OCR.
+
+    Tried a small vision model (moondream) first - it captions/guesses at what's in the
+    image rather than reading literal characters (invented dates, fake URLs). Real OCR
+    engines are deterministic and don't hallucinate, so use one instead of an LLM here.
+    """
+    return pytesseract.image_to_string(Image.open(io.BytesIO(image_bytes)))
 
 
 async def ai_extract_event(title: str, description: str) -> dict | None:
@@ -330,6 +346,48 @@ async def event_from_text(interaction: discord.Interaction, text: str, name: str
         extracted.get("date", ""),
         extracted.get("time", ""),
         text[:1000],
+        extracted.get("location"),
+        remind_before.value if remind_before else 5,
+    )
+
+
+@client.tree.command(name="event_from_image", description="Create an event from a screenshot of an announcement/form", guild=guild_obj)
+@app_commands.describe(image="Screenshot containing the event details",
+                        name="Event name (optional, auto-detected if left blank)",
+                        remind_before="Reminder timing (default 5 minutes)")
+@app_commands.choices(remind_before=REMIND_CHOICES)
+async def event_from_image(interaction: discord.Interaction, image: discord.Attachment,
+                            name: str = None, remind_before: app_commands.Choice[int] = None):
+    if not is_organiser(interaction):
+        await interaction.response.send_message("You do not have permission to manage events.", ephemeral=True)
+        return
+    if not (image.content_type or "").startswith("image/"):
+        await interaction.response.send_message("That attachment isn't an image.", ephemeral=True)
+        return
+    await interaction.response.defer()
+
+    image_bytes = await image.read()
+    transcribed = read_image_text(image_bytes)
+    if not transcribed.strip():
+        await interaction.followup.send(
+            "Couldn't read any text in that screenshot. "
+            "Use /event_from_text or /event_add instead.", ephemeral=True)
+        return
+
+    extracted = await ai_extract_event("", transcribed)
+    if not extracted:
+        await interaction.followup.send(
+            "Couldn't extract event details from that screenshot.", ephemeral=True)
+        return
+    event_name = name or extracted.get("name") or transcribed.strip().split("\n")[0][:100]
+
+    log.info("image extraction: transcribed=%r extracted=%s", transcribed[:200], extracted)
+    await create_event(
+        interaction,
+        event_name,
+        extracted.get("date", ""),
+        extracted.get("time", ""),
+        transcribed[:1000],
         extracted.get("location"),
         remind_before.value if remind_before else 5,
     )
