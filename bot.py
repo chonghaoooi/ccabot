@@ -1,11 +1,14 @@
 """Discord CCA event reminder bot. One file, MVP scope."""
+import json
 import os
+import re
 import sqlite3
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -21,6 +24,7 @@ CCA_ROLE_ID = int(os.environ["CCA_ROLE_ID"])
 ORGANISER_ROLE_ID = int(os.environ["ORGANISER_ROLE_ID"])
 TZ = ZoneInfo("Asia/Singapore")
 DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "events.db"))
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:1.5b")
 
 REMIND_CHOICES = [
     app_commands.Choice(name="5 minutes", value=5),
@@ -66,6 +70,56 @@ def fmt_dt(dt_utc: datetime) -> tuple[str, str]:
     return f"{local.day} {local.strftime('%B %Y')}", f"{hour12}:{local.strftime('%M %p')}"
 
 
+async def fetch_form_text(url: str) -> tuple[str, str]:
+    """Returns (title, description) scraped from a Google Form's viewform page."""
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            html = await resp.text()
+    title_m = re.search(r'og:title" content="([^"]*)"', html)
+    data_m = re.search(r"FB_PUBLIC_LOAD_DATA_ = (\[.*?\]);</script>", html, re.S)
+    title = title_m.group(1).strip() if title_m else "Untitled Event"
+    description = ""
+    if data_m:
+        data = json.loads(data_m.group(1))
+        description = data[1][0] or ""
+    return title, description
+
+
+async def ai_extract_event(title: str, description: str) -> dict | None:
+    """Ask the local model to pull structured event fields out of messy form text."""
+    now_local = datetime.now(TZ)
+    prompt = (
+        f"Today's date is {now_local.strftime('%Y-%m-%d')} (Asia/Singapore time). "
+        "Extract event details from this text and respond with ONLY a JSON object, "
+        'no other text: {"date": "YYYY-MM-DD", "time": "HH:MM" (24h, start time only), '
+        '"location": str or null}.\n\n'
+        f"Title: {title}\n\nText:\n{description}"
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "http://localhost:11434/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "format": "json"},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            body = await resp.json()
+    try:
+        result = json.loads(body["response"])
+    except (KeyError, json.JSONDecodeError):
+        return None
+
+    # small models don't always follow "HH:MM only" strictly (e.g. return a range) -
+    # pull the first well-formed date/time out of whatever it gave back.
+    date_m = re.search(r"\d{4}-\d{2}-\d{2}", str(result.get("date", "")))
+    time_m = re.search(r"\d{2}:\d{2}", str(result.get("time", "")))
+    if date_m:
+        result["date"] = date_m.group(0)
+    if time_m:
+        result["time"] = time_m.group(0)
+    return result
+
+
 class CCARoleView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -109,36 +163,27 @@ client = Bot()
 guild_obj = discord.Object(id=GUILD_ID)
 
 
-@client.tree.command(name="event_add", description="Create a CCA event", guild=guild_obj)
-@app_commands.describe(name="Event name", date="YYYY-MM-DD", time="HH:MM (24h)",
-                        description="Event description", location="Location (optional)",
-                        remind_before="Reminder timing (default 5 minutes)")
-@app_commands.choices(remind_before=REMIND_CHOICES)
-async def event_add(interaction: discord.Interaction, name: str, date: str, time: str,
-                     description: str, location: str = None,
-                     remind_before: app_commands.Choice[int] = None):
-    if not is_organiser(interaction):
-        await interaction.response.send_message("You do not have permission to manage events.", ephemeral=True)
-        return
+async def create_event(interaction: discord.Interaction, name: str, date: str, time: str,
+                        description: str, location: str, remind_minutes: int):
+    """Shared by /event_add and /event_from_form. Returns True on success."""
     if len(name) > 100 or len(description) > 1000 or (location and len(location) > 200):
-        await interaction.response.send_message("Name/description/location too long.", ephemeral=True)
-        return
+        await interaction.followup.send("Name/description/location too long.", ephemeral=True)
+        return False
     try:
         naive = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
     except ValueError:
-        await interaction.response.send_message(
-            "Invalid date/time. Use YYYY-MM-DD and 24h HH:MM.", ephemeral=True)
-        return
+        await interaction.followup.send(
+            f"Invalid date/time extracted ({date} {time}). Use YYYY-MM-DD and 24h HH:MM.", ephemeral=True)
+        return False
     start_local = naive.replace(tzinfo=TZ)
     start_utc = start_local.astimezone(ZoneInfo("UTC"))
     now_utc = datetime.now(ZoneInfo("UTC"))
     if start_utc <= now_utc:
-        await interaction.response.send_message("Event must be scheduled in the future.", ephemeral=True)
-        return
-    remind_minutes = remind_before.value if remind_before else 5
+        await interaction.followup.send("Event must be scheduled in the future.", ephemeral=True)
+        return False
     if now_utc + timedelta(minutes=remind_minutes) > start_utc:
-        await interaction.response.send_message("Reminder time is longer than time remaining before event.", ephemeral=True)
-        return
+        await interaction.followup.send("Reminder time is longer than time remaining before event.", ephemeral=True)
+        return False
 
     cur = db.execute(
         "INSERT INTO events (creator_id, name, description, location, start_time_utc, remind_before_minutes) "
@@ -156,7 +201,62 @@ async def event_add(interaction: discord.Interaction, name: str, date: str, time
         embed.add_field(name="📍 Location", value=location, inline=True)
     embed.add_field(name="🔔 Reminder", value=f"{remind_minutes} minutes before", inline=False)
     embed.set_footer(text=f"Event ID: {event_id}")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
+    return True
+
+
+@client.tree.command(name="event_add", description="Create a CCA event", guild=guild_obj)
+@app_commands.describe(name="Event name", date="YYYY-MM-DD", time="HH:MM (24h)",
+                        description="Event description", location="Location (optional)",
+                        remind_before="Reminder timing (default 5 minutes)")
+@app_commands.choices(remind_before=REMIND_CHOICES)
+async def event_add(interaction: discord.Interaction, name: str, date: str, time: str,
+                     description: str, location: str = None,
+                     remind_before: app_commands.Choice[int] = None):
+    if not is_organiser(interaction):
+        await interaction.response.send_message("You do not have permission to manage events.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    await create_event(interaction, name, date, time, description, location,
+                        remind_before.value if remind_before else 5)
+
+
+@client.tree.command(name="event_from_form", description="Create an event by extracting details from a Google Form link", guild=guild_obj)
+@app_commands.describe(url="Google Form link (viewform)", remind_before="Reminder timing (default 5 minutes)")
+@app_commands.choices(remind_before=REMIND_CHOICES)
+async def event_from_form(interaction: discord.Interaction, url: str,
+                           remind_before: app_commands.Choice[int] = None):
+    if not is_organiser(interaction):
+        await interaction.response.send_message("You do not have permission to manage events.", ephemeral=True)
+        return
+    if "docs.google.com/forms" not in url:
+        await interaction.response.send_message("That doesn't look like a Google Form link.", ephemeral=True)
+        return
+    await interaction.response.defer()
+
+    try:
+        title, description = await fetch_form_text(url)
+    except (aiohttp.ClientError, TimeoutError):
+        await interaction.followup.send("Couldn't fetch that form. Check the link is public.", ephemeral=True)
+        return
+
+    extracted = await ai_extract_event(title, description)
+    if not extracted:
+        await interaction.followup.send(
+            "Couldn't extract event details from that form. Is Ollama running? "
+            "Use /event_add manually instead.", ephemeral=True)
+        return
+
+    log.info("form extraction for %s: %s", url, extracted)
+    await create_event(
+        interaction,
+        title,
+        extracted.get("date", ""),
+        extracted.get("time", ""),
+        description[:1000],
+        extracted.get("location"),
+        remind_before.value if remind_before else 5,
+    )
 
 
 @client.tree.command(name="event_list", description="List upcoming events", guild=guild_obj)
